@@ -1,0 +1,439 @@
+================================================================================
+         AI-BASED DEEPFAKE INTERACTION SYSTEM - PROJECT DOCUMENTATION
+                    CENG 384 - Intro. to Signal Processing
+================================================================================
+
+Team Members:
+  - Mohammed Alweli - 220204900
+  - Asli Sila Caralan - 220204020
+  - Alperen Gokay Goktas - 220201040
+  - Nil Savci - 230201022
+
+================================================================================
+                           PROJECT OVERVIEW
+================================================================================
+
+This project is a desktop application that demonstrates Digital Signal
+Processing (DSP) concepts through two main features:
+
+  1. VOICE CLONING - Clones a person's voice from an audio sample and
+     generates new speech in that voice.
+
+  2. FACE SWAPPING - Swaps a face from a photo onto a live webcam feed
+     in real-time.
+
+The application runs locally on macOS with Apple Silicon (M3) and uses
+open-source AI models combined with classical DSP techniques.
+
+Platform: macOS (Apple Silicon M3)
+Language: Python 3.13
+UI Framework: CustomTkinter (dark theme)
+Architecture: Modular MVC with tabbed interface
+
+
+================================================================================
+                         PROJECT STRUCTURE
+================================================================================
+
+dsp project/
+  main.py                          - Application entry point
+  config.py                        - Global configuration and constants
+  requirements.txt                 - Python dependencies
+  models/
+    face_landmarker.task           - MediaPipe face landmark model
+    face_detector.tflite           - MediaPipe face detection model
+    inswapper_128.onnx             - InsightFace face swap neural model (529MB)
+  outputs/                         - Generated output files
+  app/
+    modules/
+      voice_cloning.py             - Voice cloning engine
+      face_swap.py                 - Face swap engine
+      input_module.py              - File loading and validation
+      preprocessing.py             - Audio/image preprocessing
+      evaluation.py                - Quality metrics (SNR, PSNR, SSIM)
+      output_module.py             - File saving and export
+    ui/
+      main_window.py               - Main application window with tabs
+      voice_panel.py               - Voice cloning UI with visualizations
+      face_panel.py                - Face swap UI with live webcam
+      logs_panel.py                - Real-time log viewer
+    utils/
+      file_utils.py                - File system utilities
+      logger.py                    - Thread-safe global logging system
+
+
+================================================================================
+                        LIBRARIES AND THEIR ROLES
+================================================================================
+
+CORE DSP & AUDIO PROCESSING:
+  - librosa (0.10+)        : Audio loading, resampling, pitch detection (pYIN),
+                              MFCC extraction, spectral analysis, mel spectrograms,
+                              pitch shifting, time stretching, onset detection
+  - numpy (1.24+)          : Matrix operations, FFT, signal math, array processing
+  - scipy (1.11+)          : Butterworth filter design, digital filtering (lfilter)
+  - soundfile (0.12+)      : Reading/writing WAV audio files
+  - sounddevice            : Real-time audio playback through speakers
+  - noisereduce            : Spectral gating noise reduction algorithm
+  - pyttsx3                : Offline text-to-speech (backup)
+
+VOICE CLONING:
+  - edge-tts               : Microsoft neural TTS voices (preset voice generation)
+  - f5-tts-mlx             : Neural voice cloning model (Apple Silicon MLX)
+  - mlx-whisper            : Speech-to-text transcription (Whisper on MLX)
+
+COMPUTER VISION & FACE PROCESSING:
+  - opencv-python (4.8+)   : Video capture, image processing, frame manipulation,
+                              color conversion, Gaussian blur, seamless clone
+  - mediapipe (0.10+)      : Face detection with bounding boxes and confidence
+  - insightface            : Face analysis (buffalo_l model), 5-point landmarks,
+                              face embeddings, gender/age detection
+  - onnxruntime            : ONNX model inference (CoreML provider for Apple GPU)
+  - Pillow (10.0+)         : Image format conversion for UI display
+
+MACHINE LEARNING FRAMEWORKS:
+  - mlx / mlx-metal        : Apple Silicon GPU acceleration for f5-tts and Whisper
+  - torch                  : PyTorch (used by InsightFace and coqui-tts)
+
+UI & VISUALIZATION:
+  - customtkinter (5.2+)   : Modern dark-themed desktop GUI framework
+  - matplotlib             : Spectrograms, waveform plots, frequency analysis,
+                              heatmaps, rendered as images in the UI
+  - tkinter                : Canvas widget for waveform timeline
+
+UTILITIES:
+  - asyncio                : Async I/O for edge-tts API calls
+  - subprocess             : Running voice cloning in separate processes
+  - threading              : Background processing for UI responsiveness
+  - json                   : Data serialization for subprocess communication
+
+
+================================================================================
+                     HOW VOICE CLONING WORKS
+================================================================================
+
+The voice cloning system has two modes:
+
+--- MODE 1: PRESET VOICES (edge-tts) ---
+
+  1. User selects a voice style (Deep Male, Warm Female, British Male, etc.)
+  2. User types text to be spoken
+  3. The system calls Microsoft's edge-tts neural TTS API
+  4. The generated audio is loaded with librosa at 16kHz
+  5. Pitch shifting is applied using librosa.effects.pitch_shift
+     (each preset has a predefined pitch_shift value in semitones)
+  6. Audio is peak-normalized to 0.9 and saved as WAV
+  7. The audio is played through speakers via sounddevice
+
+  Available Preset Voices:
+    - Deep Male        : en-US-ChristopherNeural, pitch -3
+    - Warm Female      : en-US-JennyNeural, pitch 0
+    - Very Deep Male   : en-US-EricNeural, pitch -5
+    - British Female   : en-GB-SoniaNeural, pitch 0
+    - Casual Male      : en-US-GuyNeural, pitch -2
+    - British Male     : en-GB-RyanNeural, pitch 0
+    - Bright Female    : en-US-EmmaNeural, pitch 0
+    - Default          : en-US-AriaNeural, pitch 0
+
+
+--- MODE 2: VOICE CLONING FROM AUDIO SAMPLE (f5-tts-mlx) ---
+
+  Step 1: AUDIO UPLOAD
+    - User uploads an MP3 or WAV file
+    - Audio is loaded at 24kHz mono using librosa
+    - A waveform visualization is displayed on a canvas
+
+  Step 2: REGION SELECTION
+    - User clicks on the waveform to preview different parts
+    - User adjusts position and duration sliders to select a region
+    - Selected region is highlighted in green on the waveform
+
+  Step 3: AUDIO PROCESSING (when user clicks "Use This Region")
+    a) SILENCE TRIMMING
+       - librosa.effects.trim removes silence from edges (top_db=20)
+
+    b) NOISE REDUCTION
+       - noisereduce.reduce_noise applies spectral gating (prop_decrease=0.8)
+       - This removes background noise while preserving voice
+       - Before/after visualization is shown with:
+         * Noise Removed percentage
+         * SNR Improvement in dB
+         * Signal Preserved percentage
+         * Before/after waveforms and spectrograms
+
+    c) REFERENCE TRIMMING
+       - If cleaned audio > 8 seconds, the loudest 8-second segment is found
+         by scanning with 1-second hops and computing RMS energy
+       - Best segment is selected for the cloning model
+
+    d) AUTO-TRANSCRIPTION
+       - The FULL selected region (before trimming) is transcribed using
+         mlx-whisper (Whisper model running on Apple MLX)
+       - This gives the cloning model context about what is being said
+       - Full transcription provides better accuracy than transcribing
+         only the trimmed 8-second segment
+
+  Step 4: VOICE GENERATION
+    - f5-tts-mlx runs in a SUBPROCESS (to avoid GPU conflicts with the GUI)
+    - Parameters passed:
+      * generation_text: what the clone should say
+      * ref_audio_path: the cleaned 8-second reference WAV
+      * ref_audio_text: the auto-transcription from Whisper
+      * steps: 8 (inference steps, balances speed vs quality)
+      * speed: 1.0 (playback speed)
+    - If output is too small (<10KB), retries with forced duration
+    - Output is saved as WAV at 24kHz
+
+  Step 5: POST-PROCESSING
+    - Optional pitch adjustment via librosa.effects.pitch_shift
+    - Optional speed adjustment via librosa.effects.time_stretch
+    - Peak normalization to 0.9
+    - Audio is played through speakers
+
+  Step 6: ANALYSIS & METRICS
+    After generation, the following is displayed:
+
+    Quality Gauges:
+      * SNR (Signal-to-Noise Ratio): Computed as 10*log10(signal_power/noise_power)
+        between reference and output. Higher = cleaner audio.
+      * Audio Clarity: Based on output RMS energy. Excellent/Good/Weak.
+      * Voice Match: MFCC cosine similarity between reference and output.
+        Extracts 13 MFCCs from each, computes dot product / norms.
+        High (>0.85) / Medium (>0.6) / Low.
+      * Pitch Accuracy: Compares median fundamental frequency (F0) using
+        librosa.pyin algorithm. Shows Hz difference from reference.
+
+    Visualization Plots (2x2):
+      * Reference Spectrogram (mel spectrogram, inferno colormap)
+      * Cloned Spectrogram (mel spectrogram, magma colormap)
+      * Waveform Comparison (blue=reference, green=cloned, overlaid)
+      * Frequency Spectrum (FFT comparison up to 4kHz)
+
+
+================================================================================
+                     HOW FACE SWAPPING WORKS
+================================================================================
+
+--- FACE DETECTION ---
+
+The system uses InsightFace's buffalo_l model for face analysis:
+  - Detection model: det_10g.onnx (RetinaFace-based)
+  - Landmark model: 2d106det.onnx (106 facial landmarks)
+  - Recognition model: w600k_r50.onnx (face embeddings)
+  - Detection size: 320x320 pixels
+  - Provider: CPU (CoreML has shape compatibility issues with detection)
+
+When a face is detected, InsightFace returns:
+  - Bounding box (x1, y1, x2, y2)
+  - 5 key landmarks: left eye, right eye, nose, left mouth, right mouth
+  - Detection confidence score (0-1)
+  - Face embedding vector (512 dimensions)
+
+--- FACE SWAP PROCESS ---
+
+  1. SOURCE FACE LOADING
+     - User uploads a clear face photo
+     - InsightFace detects and extracts the face
+     - Face embedding is cached for reuse
+
+  2. LIVE WEBCAM CAPTURE
+     - Webcam frames captured at native resolution
+     - Frames downscaled to 960px width for processing
+     - Frames are horizontally flipped (mirror mode)
+
+  3. FACE DETECTION (every 3 frames)
+     - Frame is downscaled to 640px for detection
+     - InsightFace detects face and returns landmarks
+     - Detection is upscaled back to original frame coordinates
+     - Face data is cached between detection frames
+
+  4. FACE SWAP (asynchronous, runs in background thread)
+     - inswapper_128.onnx model (529MB) performs the swap
+     - Provider: CoreML (Apple Neural Engine) with CPU fallback
+     - The model takes:
+       * Target face (from webcam): pose, expression, lighting
+       * Source face (from photo): identity, skin texture
+     - Generates a new face that has the SOURCE identity but matches
+       the TARGET pose, expression, and lighting
+     - Paste_back=True overlays result onto original frame
+
+  5. EXPANDED BLENDING
+     After the neural swap, additional blending is applied:
+     - Face region is expanded: 45% upward (forehead/hairline),
+       15% to sides, 10% downward
+     - An elliptical mask is created covering the expanded region
+     - Heavy Gaussian blur is applied to the mask edges
+       (kernel size = face_width/4, minimum 31px)
+     - Alpha blending merges swapped face with original frame
+       using the soft mask: result = swapped*mask + original*(1-mask)
+     - This creates smooth transition at forehead/hairline boundary
+
+  6. EXPRESSION TRACKING (displayed on webcam panel)
+     Using the 5 InsightFace landmarks:
+     - Head Direction: Computed from nose offset relative to eye center.
+       Forward/Left/Right based on yaw ratio.
+     - Mouth State: Distance between mouth corners relative to eye
+       distance. Open if ratio > 0.55.
+     - Eye State: Vertical distance from eyes to nose baseline relative
+       to face height. Open if ratio > 0.15.
+
+  7. UI DISPLAY
+     - Left panel: Webcam with bounding box, confidence %, landmarks,
+       expression labels
+     - Right panel: Live swapped face (updates asynchronously)
+     - Bottom bar: Swap FPS, live PSNR, live SSIM
+     - Webcam runs at ~25 FPS, swap updates as fast as model processes
+
+--- FACE SWAP ANALYSIS (on Capture Screenshot) ---
+
+  A fresh face swap is run on the captured frame, then:
+
+  Quality Gauges:
+    * PSNR: Peak Signal-to-Noise Ratio between original and swapped frame.
+      Computed as 10*log10(255^2 / MSE). Higher = less change.
+    * SSIM: Structural Similarity Index (0-1). Compares luminance,
+      contrast, and structure. Higher = more similar.
+    * Face Detection: Confidence score from InsightFace (0-100%).
+    * Blend Quality: Inverse of mean pixel difference. Shows how
+      seamlessly the swap integrates. Seamless/Good/Visible.
+
+  Visualization Plots (2x3):
+    * Source Face: The uploaded face image
+    * Detected Face + Landmarks: Webcam frame with green landmark dots
+      and bounding box
+    * Swapped Result: The final swapped frame
+    * Difference Heatmap: cv2.absdiff visualized with "hot" colormap,
+      showing exactly which pixels changed
+    * Extracted Face Region: Cropped original face from webcam
+    * Swapped Face Region: Cropped swapped face for comparison
+
+
+================================================================================
+                      EVALUATION METRICS
+================================================================================
+
+SNR (Signal-to-Noise Ratio) - AUDIO QUALITY
+  Formula: SNR = 10 * log10(sum(signal^2) / sum(noise^2))
+  Where noise = original - processed
+  Unit: decibels (dB)
+  Good: > 20 dB | Acceptable: > 10 dB | Poor: < 10 dB
+
+PSNR (Peak Signal-to-Noise Ratio) - IMAGE/VIDEO QUALITY
+  Formula: PSNR = 10 * log10(MAX_PIXEL^2 / MSE)
+  Where MSE = mean((original - processed)^2), MAX_PIXEL = 255
+  Unit: decibels (dB)
+  Good: > 30 dB | Acceptable: > 20 dB | Poor: < 20 dB
+
+SSIM (Structural Similarity Index) - VISUAL SIMILARITY
+  Compares three components: luminance, contrast, structure
+  Formula uses means, variances, and covariance of image patches
+  Constants: c1 = (0.01*255)^2, c2 = (0.03*255)^2
+  Range: 0 to 1 (1 = identical)
+  Good: > 0.8 | Acceptable: > 0.5 | Poor: < 0.5
+
+MFCC COSINE SIMILARITY - VOICE MATCH
+  Extracts 13 Mel-Frequency Cepstral Coefficients from both signals
+  Computes cosine similarity: dot(ref_mfcc, out_mfcc) / (|ref| * |out|)
+  Range: 0 to 1 (1 = identical voice characteristics)
+
+PITCH ACCURACY - VOICE PITCH MATCH
+  Uses pYIN algorithm (librosa.pyin) to detect fundamental frequency (F0)
+  Compares median F0 of reference vs output
+  Shows difference in Hz
+  Good: < 20 Hz | Acceptable: < 50 Hz | Poor: > 50 Hz
+
+
+================================================================================
+                      DSP TECHNIQUES DEMONSTRATED
+================================================================================
+
+AUDIO DSP:
+  - Fast Fourier Transform (FFT) for frequency spectrum analysis
+  - Mel-frequency spectrogram computation
+  - MFCC extraction for voice characterization
+  - Pitch detection using pYIN (probabilistic YIN) algorithm
+  - Pitch shifting via phase vocoder
+  - Time stretching without pitch change
+  - Audio resampling between sample rates
+  - Peak normalization
+  - Spectral gating for noise reduction
+  - Butterworth filter design (used in timbre matching)
+  - Digital filtering with lfilter
+
+IMAGE/VIDEO DSP:
+  - Face detection using neural networks
+  - Facial landmark extraction
+  - Image color space conversion (BGR to RGB)
+  - Gaussian blur for mask feathering
+  - Alpha blending for seamless compositing
+  - Image resizing and interpolation
+  - Difference computation for quality assessment
+  - Elliptical mask generation
+
+
+================================================================================
+                        APPLICATION FEATURES
+================================================================================
+
+VOICE CLONING TAB:
+  [x] 8 preset neural voice styles (edge-tts)
+  [x] Upload audio sample for voice cloning (MP3/WAV)
+  [x] Interactive waveform timeline with click-to-preview
+  [x] Adjustable selection position and duration
+  [x] Automatic noise reduction with before/after visualization
+  [x] Automatic speech transcription (Whisper)
+  [x] Neural voice cloning (f5-tts-mlx on Apple Silicon)
+  [x] Pitch and speed adjustment sliders
+  [x] Generate & Play with loading indicator
+  [x] Replay last output button
+  [x] Quality metrics: SNR, Clarity, Voice Match, Pitch Accuracy
+  [x] Visualization: spectrograms, waveforms, frequency spectrum
+  [x] Noise reduction analysis with metrics and plots
+
+FACE SWAP TAB:
+  [x] Upload source face image
+  [x] Live webcam feed with face detection
+  [x] Real-time face bounding box with confidence %
+  [x] 5-point facial landmark display
+  [x] Expression tracking (head direction, mouth, eyes)
+  [x] Neural face swap (InsightFace inswapper_128)
+  [x] CoreML GPU acceleration for swap model
+  [x] Expanded blending for forehead/hairline
+  [x] Asynchronous swap (smooth webcam + background processing)
+  [x] Capture screenshot
+  [x] Live PSNR and SSIM metrics
+  [x] Face swap analysis with 4 gauges and 6 plots
+  [x] Scrollable interface for analysis viewing
+
+LOGS TAB:
+  [x] Real-time color-coded log viewer
+  [x] Log levels: Info (gray), Success (green), Error (red), Warning (orange)
+  [x] Timestamps on all entries
+  [x] Clear logs button
+  [x] Thread-safe logging from all modules
+
+GENERAL:
+  [x] Dark theme UI
+  [x] Responsive design with minimum window size
+  [x] Background threading for all heavy operations
+  [x] Error handling with user-friendly messages
+  [x] File format validation (WAV, MP3, JPG, PNG, MP4)
+  [x] Automatic output directory management
+
+
+================================================================================
+                         HOW TO RUN
+================================================================================
+
+  cd ~/Desktop/"dsp project"
+  source venv/bin/activate
+  python main.py
+
+First run may download models:
+  - InsightFace buffalo_l (~280MB)
+  - f5-tts-mlx model (~500MB)
+  - Whisper model (~500MB)
+
+After first download, all models are cached locally.
+
+================================================================================
