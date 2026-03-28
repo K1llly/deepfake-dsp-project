@@ -1,4 +1,4 @@
-# AI-Based Deepfake Interaction System
+Deepfake Interaction System
 
 **CENG 384 - Intro. to Signal Processing**
 
