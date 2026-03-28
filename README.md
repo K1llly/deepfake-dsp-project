@@ -6,10 +6,10 @@ A desktop application that demonstrates Digital Signal Processing (DSP) concepts
 
 ## Team Members
 
-- Alperen Gokay Goktas - 220201040
-- Mohammed Alweli - 220204900
-- Asli Sila Caralan - 220204020
-- Nil Savci - 230201022
+- Alperen Gokay Goktas
+- Mohammed Alweli
+- Asli Sila Caralan
+- Nil Savci
 
 ## Features
 
