@@ -6,7 +6,12 @@ class EvaluationModule:
     """Calculates quality metrics: SNR, PSNR, SSIM."""
 
     def calculate_snr(self, original_audio, processed_audio):
-        """Calculate Signal-to-Noise Ratio in dB."""
+        """Calculate Signal-to-Noise Ratio in dB.
+
+        Only meaningful when processed = original + noise (same content).
+        For unrelated audio (e.g. a voice clone vs the reference), use
+        calculate_hnr on the output instead.
+        """
         min_length = min(len(original_audio), len(processed_audio))
         original = original_audio[:min_length]
         processed = processed_audio[:min_length]
@@ -20,6 +25,50 @@ class EvaluationModule:
 
         snr = 10 * np.log10(signal_power / noise_power)
         return round(snr, 2)
+
+    def calculate_hnr(self, audio, sample_rate, frame_length=2048, hop_length=512):
+        """Harmonics-to-Noise Ratio in dB (output-only audio quality).
+
+        Per-frame normalized autocorrelation peak in the voicing range
+        (50-500 Hz fundamental), averaged over voiced frames.
+        Clean speech: >20 dB. Noisy/distorted: <10 dB.
+        """
+        audio, _ = librosa.effects.trim(audio, top_db=25)
+        if len(audio) < frame_length:
+            return 0.0
+
+        min_lag = max(1, int(sample_rate / 500))
+        max_lag = min(int(sample_rate / 50), frame_length - 1)
+        if max_lag <= min_lag:
+            return 0.0
+
+        frames = librosa.util.frame(
+            audio, frame_length=frame_length, hop_length=hop_length
+        )
+
+        # Unbiased autocorrelation correction: np.correlate produces a
+        # triangular taper because each lag has fewer overlapping samples.
+        # Divide by (N - k) per lag to remove that bias before normalizing.
+        taper = np.arange(frame_length, 0, -1, dtype=np.float64)
+
+        hnr_values = []
+        for i in range(frames.shape[1]):
+            frame = frames[:, i]
+            rms = float(np.sqrt(np.mean(frame ** 2)))
+            if rms < 0.01:
+                continue
+            ac = np.correlate(frame, frame, mode="full")[frame_length - 1:]
+            ac = ac / taper
+            if ac[0] <= 0:
+                continue
+            ac = ac / ac[0]
+            peak = float(np.max(ac[min_lag:max_lag]))
+            peak = min(0.999, max(0.001, peak))
+            hnr_values.append(10 * np.log10(peak / (1 - peak)))
+
+        if not hnr_values:
+            return 0.0
+        return round(float(np.mean(hnr_values)), 2)
 
     def calculate_psnr(self, original_image, processed_image):
         """Calculate Peak Signal-to-Noise Ratio in dB."""

@@ -216,15 +216,16 @@ class VoicePanel(ctk.CTkFrame):
 
             # --- Compute Metrics ---
 
-            # SNR
-            if min_len > 1000:
-                snr = self.evaluation.calculate_snr(ref_audio[:min_len], out_audio[:min_len])
-                snr_val = snr if snr != float("inf") else 50
+            # Output HNR (Harmonics-to-Noise Ratio, output-only audio quality)
+            # Autocorrelation-based: how periodic/voiced the clone sounds.
+            if len(out_audio) > 2048:
+                hnr_val = self.evaluation.calculate_hnr(out_audio, out_sr)
+                hnr_val = hnr_val if hnr_val != float("inf") else 30.0
             else:
-                snr_val = 0
-            snr_pct = min(1.0, max(0, snr_val / 40))
-            snr_label = f"{snr_val:.1f} dB"
-            snr_color = "#2ecc71" if snr_val > 20 else "#f39c12" if snr_val > 10 else "#e74c3c"
+                hnr_val = 0.0
+            hnr_pct = min(1.0, max(0, hnr_val / 25))
+            hnr_label = f"{hnr_val:.1f} dB"
+            hnr_color = "#2ecc71" if hnr_val > 20 else "#f39c12" if hnr_val > 10 else "#e74c3c"
 
             # Audio Clarity (RMS energy)
             rms = float(np.sqrt(np.mean(out_audio ** 2)))
@@ -277,13 +278,13 @@ class VoicePanel(ctk.CTkFrame):
             for i in range(4):
                 gauges.grid_columnconfigure(i, weight=1)
 
-            self._build_gauge(gauges, 0, "SNR", snr_pct, snr_label, snr_color)
+            self._build_gauge(gauges, 0, "Output HNR", hnr_pct, hnr_label, hnr_color)
             self._build_gauge(gauges, 1, "Audio Clarity", clarity_pct, clarity_label, clarity_color)
             self._build_gauge(gauges, 2, "Voice Match", match_pct, match_label, match_color)
             self._build_gauge(gauges, 3, "Pitch Accuracy", pitch_pct, pitch_label, pitch_color)
 
             self.log.success(
-                f"SNR: {snr_label} | Clarity: {clarity_label} | "
+                f"HNR: {hnr_label} | Clarity: {clarity_label} | "
                 f"Match: {match_label} ({match_pct:.0%}) | Pitch: {pitch_label}"
             )
 
