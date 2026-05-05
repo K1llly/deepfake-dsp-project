@@ -20,6 +20,44 @@ import mediapipe as mp
 from config import MODELS_DIR
 
 
+class _ThreadedCamera:
+    """Continuously reads frames in a background thread, exposing only the
+    most recent one. Eliminates input lag when the processing loop runs
+    slower than the webcam's native frame rate — the camera buffer never
+    backs up because we drain it constantly. read() returns a copy of the
+    latest frame instead of blocking on the next one.
+    """
+
+    def __init__(self, capture):
+        self._cap = capture
+        self._frame = None
+        self._lock = threading.Lock()
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while self._running:
+            ok, frame = self._cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def isOpened(self):
+        return self._cap.isOpened()
+
+    def release(self):
+        self._running = False
+        self._thread.join(timeout=1.0)
+        self._cap.release()
+
+
 class FacePanel(ctk.CTkFrame):
     """UI panel for live webcam face swapping."""
 
@@ -212,12 +250,21 @@ class FacePanel(ctk.CTkFrame):
             )
             return
 
-        self.capture = cv2.VideoCapture(0)
-        if not self.capture.isOpened():
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
             self.status_label.configure(
                 text="Could not open webcam.", text_color="red"
             )
             return
+
+        # Force a sane capture resolution so we don't grab 4K just to
+        # downscale, and keep the OS-side buffer at one frame so stale
+        # frames never queue up while the processing loop catches up.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.capture = _ThreadedCamera(cap)
 
         self.webcam_running = True
         self.start_button.configure(state="disabled")
@@ -256,8 +303,20 @@ class FacePanel(ctk.CTkFrame):
                 current_frame = cv2.flip(current_frame, 1)
                 self.last_original_frame = current_frame
 
+        # Live preview uses the fast (no-blend) swap path. For the saved
+        # screenshot, regenerate at full quality with the expanded blend.
+        full_quality = None
+        if self.last_original_frame is not None and self.source_image is not None:
+            try:
+                full_quality = self.face_swap_module.swap_faces(
+                    self.source_image, self.last_original_frame.copy()
+                )
+            except Exception:
+                full_quality = None
+        frame_to_save = full_quality if full_quality is not None else self.last_swapped_frame
+
         output_path = self.output_module.save_image(
-            self.last_swapped_frame, "live_swap_capture.png"
+            frame_to_save, "live_swap_capture.png"
         )
         self.status_label.configure(
             text=f"Saved: {os.path.basename(output_path)}", text_color="green"
@@ -445,23 +504,50 @@ class FacePanel(ctk.CTkFrame):
 
     def _webcam_loop(self):
         """Webcam loop: smooth display + async face swap in background."""
+        # buffalo_s + det_size=160 + CoreML makes detection cheap enough
+        # to run on every swap iteration, so the bbox stays fresh frame
+        # to frame and we don't need a separate tracker.
+        TARGET_FRAME_DT = 1.0 / 30
+
         frame_count = 0
         psnr_val = "--"
         ssim_val = "--"
         last_swap_result = None
+        last_swap_bbox_center = None
         swap_busy = False
         swap_fps_times = []
+        # If the (smoothed) face center hasn't moved more than this many
+        # pixels since the last swap, reuse the previous result instead of
+        # re-running the inswapper. Free FPS gain when the user is still.
+        SKIP_THRESHOLD_PX = 2.0
 
         def run_swap(frame_to_swap):
-            """Run face swap in background — called from main loop."""
-            nonlocal last_swap_result, swap_busy, swap_fps_times
+            nonlocal last_swap_result, last_swap_bbox_center, swap_busy, swap_fps_times
             swap_start = time.time()
             try:
-                self.face_swap_module.detect_face(frame_to_swap)
-                result = self.face_swap_module.swap_with_cached_face(frame_to_swap)
+                if not self.face_swap_module.detect_face(frame_to_swap):
+                    swap_busy = False
+                    return
+                cur_bbox = self.face_swap_module.last_target_face.bbox
+                cur_center = np.array([
+                    (cur_bbox[0] + cur_bbox[2]) / 2,
+                    (cur_bbox[1] + cur_bbox[3]) / 2,
+                ])
+                if (
+                    last_swap_bbox_center is not None
+                    and last_swap_result is not None
+                    and float(np.linalg.norm(cur_center - last_swap_bbox_center))
+                    < SKIP_THRESHOLD_PX
+                ):
+                    swap_busy = False
+                    return
+                result = self.face_swap_module.swap_with_cached_face(
+                    frame_to_swap, fast=True
+                )
                 if result is not None:
                     last_swap_result = result
                     self.last_swapped_frame = result
+                    last_swap_bbox_center = cur_center
             except Exception:
                 pass
             swap_elapsed = time.time() - swap_start
@@ -471,8 +557,11 @@ class FacePanel(ctk.CTkFrame):
             swap_busy = False
 
         while self.webcam_running and self.capture is not None:
+            loop_start = time.time()
+
             success, frame = self.capture.read()
             if not success:
+                time.sleep(0.005)
                 continue
 
             h, w = frame.shape[:2]
@@ -484,26 +573,21 @@ class FacePanel(ctk.CTkFrame):
             frame_count += 1
             self.last_original_frame = frame.copy()
 
-            # Annotate webcam (lightweight — just face detection box)
             annotated_frame = self._annotate_webcam_frame(frame.copy())
 
-            # Launch swap in background thread if not busy
             if not swap_busy and self.source_image is not None:
                 swap_busy = True
                 threading.Thread(
                     target=run_swap, args=(frame.copy(),), daemon=True
                 ).start()
 
-            # Use last swap result for display
             display_swap = last_swap_result if last_swap_result is not None else frame
 
-            # Calculate swap FPS
             if swap_fps_times:
                 swap_fps = len(swap_fps_times) / sum(swap_fps_times)
             else:
                 swap_fps = 0
 
-            # PSNR/SSIM occasionally
             if frame_count % 30 == 0 and last_swap_result is not None:
                 try:
                     small_orig = cv2.resize(frame, (128, 96))
@@ -513,13 +597,14 @@ class FacePanel(ctk.CTkFrame):
                 except Exception:
                     pass
 
-            # Update UI — webcam is smooth, swap updates when ready
             self.after(0, self._update_displays,
                        annotated_frame, display_swap, swap_fps,
                        psnr_val, ssim_val)
 
-            # Smooth webcam at ~25 FPS
-            time.sleep(0.04)
+            elapsed = time.time() - loop_start
+            sleep_time = TARGET_FRAME_DT - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def _annotate_webcam_frame(self, frame):
         """Draw face box, landmarks, confidence, and expression info."""
