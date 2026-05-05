@@ -1,8 +1,6 @@
 import os
-import sys
-import json
 import asyncio
-import subprocess
+import threading
 import numpy as np
 import librosa
 import soundfile as sf
@@ -10,6 +8,10 @@ import edge_tts
 
 from config import DEFAULT_SAMPLE_RATE
 from app.utils.file_utils import generate_output_path
+
+# Auto-accept the Coqui XTTS-v2 license terms so the first call doesn't
+# block on an interactive prompt.
+os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
 
 PRESET_VOICE_PROFILES = {
@@ -21,17 +23,46 @@ PRESET_VOICE_PROFILES = {
     "British Male": {"voice": "en-GB-RyanNeural", "pitch_shift": 0},
     "Bright Female": {"voice": "en-US-EmmaNeural", "pitch_shift": 0},
     "Default": {"voice": "en-US-AriaNeural", "pitch_shift": 0},
+    "Turkish Male (Ahmet)": {"voice": "tr-TR-AhmetNeural", "pitch_shift": 0},
+    "Turkish Female (Emel)": {"voice": "tr-TR-EmelNeural", "pitch_shift": 0},
 }
 
-F5_SAMPLE_RATE = 24000
+# XTTS-v2 supported language codes (ISO 639-1, with zh-cn for Mandarin).
+XTTS_LANGUAGES = {
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru",
+    "nl", "cs", "ar", "zh-cn", "hu", "ko", "ja", "hi",
+}
 
 
 class VoiceCloningModule:
-    """Voice cloning using f5-tts-mlx (real cloning) + edge-tts (presets)."""
+    """Voice cloning via Coqui XTTS-v2 (multilingual, cross-lingual) and
+    edge-tts neural voices for the preset path.
+    """
 
     def __init__(self):
         self.reference_path = None
         self.reference_text = None
+        self._xtts = None
+        self._xtts_load_lock = threading.Lock()
+        # Background-load the XTTS model so the user's first clone doesn't
+        # pay the ~10 s cold-start. Subsequent calls reuse the loaded model.
+        threading.Thread(target=self._load_xtts, daemon=True).start()
+
+    def _load_xtts(self):
+        """Idempotently load XTTS-v2; safe to call from multiple threads."""
+        with self._xtts_load_lock:
+            if self._xtts is not None:
+                return self._xtts
+            from TTS.api import TTS
+            self._xtts = TTS(
+                model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+                progress_bar=False,
+            )
+            return self._xtts
+
+    def is_ready(self):
+        """True once the XTTS model has finished loading in the background."""
+        return self._xtts is not None
 
     def get_preset_names(self):
         return list(PRESET_VOICE_PROFILES.keys())
@@ -41,10 +72,12 @@ class VoiceCloningModule:
         profile = PRESET_VOICE_PROFILES.get(
             preset_name, PRESET_VOICE_PROFILES["Default"]
         )
-
         if output_filename is None:
-            safe_name = preset_name.replace(" ", "_").lower()
-            output_filename = f"voice_{safe_name}.wav"
+            safe = (
+                preset_name.replace(" ", "_")
+                .replace("(", "").replace(")", "").lower()
+            )
+            output_filename = f"voice_{safe}.wav"
 
         raw_path = generate_output_path("_raw_neural.mp3")
         final_path = generate_output_path(output_filename)
@@ -55,7 +88,7 @@ class VoiceCloningModule:
         pitch_shift = profile.get("pitch_shift", 0)
         if pitch_shift != 0:
             audio_data = librosa.effects.pitch_shift(
-                y=audio_data, sr=sample_rate, n_steps=pitch_shift
+                y=audio_data, sr=sample_rate, n_steps=pitch_shift,
             )
 
         self._normalize_and_save(audio_data, sample_rate, final_path)
@@ -63,108 +96,59 @@ class VoiceCloningModule:
         return final_path
 
     def load_reference_voice(self, audio_path, reference_text=""):
-        """Load and prepare a reference voice sample for cloning."""
-        # Convert to mono 24kHz WAV for f5-tts
+        """Prepare a reference audio sample for cloning. XTTS handles its
+        own resampling, so we just trim silence and cap the length at 15 s.
+        """
         prepared_path = generate_output_path("_ref_prepared.wav")
-        audio, _ = librosa.load(audio_path, sr=F5_SAMPLE_RATE, mono=True)
-
-        # Trim silence and quiet sections from edges
+        audio, sr = librosa.load(audio_path, sr=None, mono=True)
         audio, _ = librosa.effects.trim(audio, top_db=20)
-
-        # Find the loudest 5-second segment (most likely clean speech)
-        max_samples = F5_SAMPLE_RATE * 5
+        max_samples = int(15 * sr)
         if len(audio) > max_samples:
-            # Find the segment with highest RMS energy (most speech)
-            best_start = 0
-            best_rms = 0
-            hop = F5_SAMPLE_RATE
-            for start in range(0, len(audio) - max_samples, hop):
-                segment = audio[start:start + max_samples]
-                rms = float(np.sqrt(np.mean(segment ** 2)))
-                if rms > best_rms:
-                    best_rms = rms
-                    best_start = start
-            audio = audio[best_start:best_start + max_samples]
-
-        sf.write(prepared_path, audio, F5_SAMPLE_RATE)
-
+            audio = audio[:max_samples]
+        sf.write(prepared_path, audio, sr)
         self.reference_path = prepared_path
         self.reference_text = reference_text
-
-        duration = len(audio) / F5_SAMPLE_RATE
-        return duration
+        return len(audio) / sr
 
     def get_profile_summary(self):
         if self.reference_path is None:
             return "No voice sample loaded."
-        audio, _ = librosa.load(self.reference_path, sr=F5_SAMPLE_RATE)
-        duration = len(audio) / F5_SAMPLE_RATE
-        return f"Duration: {duration:.1f}s | Ready for cloning"
+        audio, sr = librosa.load(self.reference_path, sr=None)
+        return f"Duration: {len(audio)/sr:.1f} s | Ready for cloning"
 
-    def synthesize_from_reference(self, text, output_filename=None):
-        """Clone the reference voice using f5-tts-mlx in a subprocess."""
+    def synthesize_from_reference(self, text, output_filename=None, language="tr"):
+        """Clone the reference voice using XTTS-v2.
+
+        language must be one of XTTS_LANGUAGES; falls back to English if
+        an unsupported code is passed.
+        """
         if self.reference_path is None:
             raise ValueError("No reference voice loaded.")
-
+        if language not in XTTS_LANGUAGES:
+            language = "en"
         if output_filename is None:
             output_filename = "cloned_voice.wav"
-
         final_path = generate_output_path(output_filename)
 
-        word_count = len(text.split())
-        duration_sec = max(3.0, word_count * 0.4)
-
-        script = "\n".join([
-            "import sys, os",
-            "from f5_tts_mlx.generate import generate",
-            "try:",
-            f"    generate(",
-            f"        generation_text={json.dumps(text)},",
-            f"        ref_audio_path={json.dumps(self.reference_path)},",
-            f"        ref_audio_text={json.dumps(self.reference_text or '')},",
-            f"        output_path={json.dumps(final_path)},",
-            f"        steps=32, speed=1.0,",
-            f"    )",
-            f"    if os.path.getsize({json.dumps(final_path)}) < 10000:",
-            f"        print('Retrying with forced duration')",
-            f"        generate(",
-            f"            generation_text={json.dumps(text)},",
-            f"            ref_audio_path={json.dumps(self.reference_path)},",
-            f"            ref_audio_text={json.dumps(self.reference_text or '')},",
-            f"            output_path={json.dumps(final_path)},",
-            f"            duration={duration_sec},",
-            f"            steps=32, speed=1.0,",
-            f"        )",
-            f"    print('SUCCESS')",
-            "except Exception as e:",
-            "    print(f'FAIL: {e}', file=sys.stderr)",
-            "    sys.exit(1)",
-        ])
-
-        env = os.environ.copy()
-        env["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=240, env=env,
-        )
-
-        if result.returncode != 0:
-            error_lines = [l for l in result.stderr.strip().split('\n') if 'FAIL:' in l]
-            error_msg = '\n'.join(error_lines) if error_lines else result.stderr[-300:]
-            raise RuntimeError(f"Voice cloning failed: {error_msg}")
+        tts = self._load_xtts()
+        try:
+            tts.tts_to_file(
+                text=text,
+                speaker_wav=self.reference_path,
+                language=language,
+                file_path=final_path,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Voice cloning failed: {e}")
 
         if not os.path.exists(final_path) or os.path.getsize(final_path) < 5000:
             raise RuntimeError("Clone failed. Try a cleaner audio sample.")
-
         return final_path
 
     def _run_edge_tts(self, text, voice, output_path):
-        """Generate speech using edge-tts neural voices."""
         async def _generate():
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(output_path)
-
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(_generate())

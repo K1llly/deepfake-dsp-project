@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import threading
 import numpy as np
 import customtkinter as ctk
@@ -17,6 +18,31 @@ from app.modules.voice_cloning import VoiceCloningModule
 from app.modules.evaluation import EvaluationModule
 from app.utils.logger import get_logger
 from config import DEFAULT_SAMPLE_RATE
+
+
+# (display_name, XTTS language code). "auto" uses the character heuristic.
+LANGUAGE_OPTIONS = [
+    ("Auto-detect", "auto"),
+    ("Turkish", "tr"),
+    ("English", "en"),
+    ("Spanish", "es"),
+    ("French", "fr"),
+    ("German", "de"),
+    ("Italian", "it"),
+    ("Portuguese", "pt"),
+    ("Russian", "ru"),
+    ("Polish", "pl"),
+    ("Dutch", "nl"),
+    ("Czech", "cs"),
+    ("Arabic", "ar"),
+    ("Chinese", "zh-cn"),
+    ("Hungarian", "hu"),
+    ("Korean", "ko"),
+    ("Japanese", "ja"),
+    ("Hindi", "hi"),
+]
+LANGUAGE_NAME_TO_CODE = dict(LANGUAGE_OPTIONS)
+MAX_HISTORY = 5
 
 
 class VoicePanel(ctk.CTkFrame):
@@ -38,7 +64,13 @@ class VoicePanel(ctk.CTkFrame):
         self.sel_start = 0.0
         self.sel_end = 5.0
 
+        # Recent clones: list of (output_path, timestamp, text_snippet, lang)
+        self._clone_history = []
+
         self._build_layout()
+        # Poll until XTTS finishes its background load so the status label
+        # can flip from "loading" to "ready" without blocking the UI.
+        self.after(500, self._poll_xtts_ready)
 
     def _build_layout(self):
         self.grid_columnconfigure(0, weight=1)
@@ -52,7 +84,15 @@ class VoicePanel(ctk.CTkFrame):
 
         ctk.CTkLabel(
             main, text="Voice Cloning", font=("Arial", 20, "bold")
-        ).pack(pady=(10, 8))
+        ).pack(pady=(10, 4))
+
+        # XTTS model load status — flips to "ready" once the background
+        # thread in VoiceCloningModule finishes loading the model.
+        self.model_status = ctk.CTkLabel(
+            main, text="⏳ Loading XTTS-v2 model in background…",
+            text_color="#f39c12", font=("Arial", 11),
+        )
+        self.model_status.pack(pady=(0, 6))
 
         # --- Voice Source Tabs ---
         source_tabs = ctk.CTkTabview(main, height=150)
@@ -128,13 +168,39 @@ class VoicePanel(ctk.CTkFrame):
         self.speed_val.pack(side="left")
         self.speed_slider.configure(command=lambda v: self.speed_val.configure(text=f"{float(v):.1f}x"))
 
+        # Output language (only consumed by the cloning path; presets ignore).
+        lang_row = ctk.CTkFrame(main, fg_color="transparent")
+        lang_row.pack(pady=2, padx=15, fill="x")
+        ctk.CTkLabel(lang_row, text="Language:", width=70).pack(side="left")
+        self.lang_selector = ctk.CTkComboBox(
+            lang_row,
+            values=[name for name, _ in LANGUAGE_OPTIONS],
+            state="readonly", width=180,
+        )
+        self.lang_selector.set("Auto-detect")
+        self.lang_selector.pack(side="left", padx=5)
+        ctk.CTkLabel(
+            lang_row,
+            text="(used when cloning from upload)",
+            text_color="gray", font=("Arial", 10),
+        ).pack(side="left", padx=10)
+
+        # Consent gate: required before any clone-from-upload.
+        self.consent_var = ctk.BooleanVar(value=False)
+        self.consent_check = ctk.CTkCheckBox(
+            main,
+            text="I confirm I have the speaker's permission to clone this voice",
+            variable=self.consent_var, font=("Arial", 11),
+        )
+        self.consent_check.pack(pady=(10, 3), padx=15, anchor="w")
+
         # --- Generate & Play ---
         self.generate_button = ctk.CTkButton(
             main, text="Generate & Play", command=self._on_generate,
             height=45, font=("Arial", 15, "bold"),
             fg_color="#2ecc71", hover_color="#27ae60"
         )
-        self.generate_button.pack(pady=(15, 3), padx=15, fill="x")
+        self.generate_button.pack(pady=(8, 3), padx=15, fill="x")
 
         # Loading bar (hidden by default)
         self.loading_bar = ctk.CTkProgressBar(main, mode="indeterminate")
@@ -151,9 +217,77 @@ class VoicePanel(ctk.CTkFrame):
         )
         self.replay_visible = False
 
+        # Recent-clones panel (hidden until at least one clone exists).
+        self.history_frame = ctk.CTkFrame(main)
+        self.history_visible = False
+
         # --- Results & Visualizations (shown after generation) ---
         self.results_frame = ctk.CTkFrame(main)
         self.results_visible = False
+
+    # ── XTTS load polling ──
+
+    def _poll_xtts_ready(self):
+        if self.voice_module.is_ready():
+            self.model_status.configure(
+                text="✓ XTTS-v2 ready", text_color="#2ecc71",
+            )
+            self.after(2500, lambda: self.model_status.pack_forget())
+            return
+        self.after(800, self._poll_xtts_ready)
+
+    # ── Language resolution ──
+
+    def _resolve_language(self, text):
+        """Honor an explicit dropdown selection; fall back to heuristic."""
+        name = self.lang_selector.get() if hasattr(self, "lang_selector") else "Auto-detect"
+        code = LANGUAGE_NAME_TO_CODE.get(name, "auto")
+        if code == "auto":
+            return self._detect_text_language(text)
+        return code
+
+    # ── Recent clones ──
+
+    def _add_to_history(self, output_path, text, lang):
+        snippet = text.strip().replace("\n", " ")
+        if len(snippet) > 50:
+            snippet = snippet[:50] + "…"
+        self._clone_history.insert(0, (output_path, time.time(), snippet, lang))
+        self._clone_history = self._clone_history[:MAX_HISTORY]
+        self._refresh_history()
+
+    def _refresh_history(self):
+        if not self._clone_history:
+            return
+        if not self.history_visible:
+            self.history_frame.pack(
+                pady=5, padx=15, fill="x", before=self.results_frame,
+            )
+            self.history_visible = True
+
+        for w in self.history_frame.winfo_children():
+            w.destroy()
+
+        ctk.CTkLabel(
+            self.history_frame, text="Recent Clones",
+            font=("Arial", 13, "bold"),
+        ).pack(pady=(8, 4), padx=10, anchor="w")
+
+        for path, ts, snippet, lang in self._clone_history:
+            row = ctk.CTkFrame(self.history_frame, fg_color="#222222")
+            row.pack(padx=10, pady=2, fill="x")
+            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            label = ctk.CTkLabel(
+                row,
+                text=f"[{time_str}] [{lang}] {snippet}",
+                anchor="w", font=("Arial", 11),
+            )
+            label.pack(side="left", expand=True, fill="x", padx=8, pady=4)
+            ctk.CTkButton(
+                row, text="▶", width=40, height=24,
+                command=lambda p=path: self._play_audio(p),
+                fg_color="#3498db", hover_color="#2980b9",
+            ).pack(side="right", padx=4, pady=4)
 
     # ── Results & Visualizations ──
 
@@ -214,63 +348,50 @@ class VoicePanel(ctk.CTkFrame):
             out_duration = len(out_audio) / out_sr
             min_len = min(len(ref_audio), len(out_audio))
 
-            # --- Compute Metrics ---
+            # All metric math lives in EvaluationModule; the panel only
+            # formats the dict for display.
+            metrics = self.evaluation.evaluate_clone(
+                ref_audio[:min_len], ref_sr, out_audio[:min_len], out_sr
+            )
 
-            # Output HNR (Harmonics-to-Noise Ratio, output-only audio quality)
-            # Autocorrelation-based: how periodic/voiced the clone sounds.
-            if len(out_audio) > 2048:
-                hnr_val = self.evaluation.calculate_hnr(out_audio, out_sr)
-                hnr_val = hnr_val if hnr_val != float("inf") else 30.0
-            else:
-                hnr_val = 0.0
-            hnr_pct = min(1.0, max(0, hnr_val / 25))
+            hnr_val = metrics["hnr_db"]
+            if hnr_val == float("inf"):
+                hnr_val = 30.0
+            hnr_pct = min(1.0, max(0.0, hnr_val / 25))
             hnr_label = f"{hnr_val:.1f} dB"
-            hnr_color = "#2ecc71" if hnr_val > 20 else "#f39c12" if hnr_val > 10 else "#e74c3c"
+            hnr_color = (
+                "#2ecc71" if hnr_val > 20
+                else "#f39c12" if hnr_val > 10 else "#e74c3c"
+            )
 
-            # Audio Clarity (RMS energy)
-            rms = float(np.sqrt(np.mean(out_audio ** 2)))
-            clarity_pct = min(1.0, rms / 0.15)
-            clarity_label = "Excellent" if clarity_pct > 0.7 else "Good" if clarity_pct > 0.4 else "Weak"
-            clarity_color = "#2ecc71" if clarity_pct > 0.7 else "#f39c12" if clarity_pct > 0.4 else "#e74c3c"
+            clarity_pct = metrics["clarity"]
+            clarity_label = (
+                "Excellent" if clarity_pct > 0.7
+                else "Good" if clarity_pct > 0.4 else "Weak"
+            )
+            clarity_color = (
+                "#2ecc71" if clarity_pct > 0.7
+                else "#f39c12" if clarity_pct > 0.4 else "#e74c3c"
+            )
 
-            # Voice Match (timbre + dynamics, content-independent)
-            # Uses MFCC[1:] (skip log-energy), delta, and delta-delta means.
-            # Trim silence on both clips so the comparison reflects voiced speech only.
-            if min_len > 1000:
-                ref_voiced, _ = librosa.effects.trim(ref_audio, top_db=25)
-                out_voiced, _ = librosa.effects.trim(out_audio, top_db=25)
+            match_pct = metrics["voice_similarity"]
+            match_label = (
+                "High" if match_pct > 0.85
+                else "Medium" if match_pct > 0.6 else "Low"
+            )
+            match_color = (
+                "#2ecc71" if match_pct > 0.85
+                else "#f39c12" if match_pct > 0.6 else "#e74c3c"
+            )
 
-                def _voice_embed(y, sr):
-                    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)[1:]
-                    d1 = librosa.feature.delta(mfcc)
-                    d2 = librosa.feature.delta(mfcc, order=2)
-                    feat = np.concatenate([
-                        np.mean(mfcc, axis=1),
-                        np.mean(d1, axis=1),
-                        np.mean(d2, axis=1),
-                    ])
-                    return feat / (np.linalg.norm(feat) + 1e-8)
-
-                ref_feat = _voice_embed(ref_voiced, ref_sr)
-                out_feat = _voice_embed(out_voiced, out_sr)
-                cosine_sim = float(np.dot(ref_feat, out_feat))
-                match_pct = max(0.0, min(1.0, cosine_sim))
-            else:
-                match_pct = 0.5
-            match_label = "High" if match_pct > 0.85 else "Medium" if match_pct > 0.6 else "Low"
-            match_color = "#2ecc71" if match_pct > 0.85 else "#f39c12" if match_pct > 0.6 else "#e74c3c"
-
-            # Pitch Accuracy
-            ref_f0, _, _ = librosa.pyin(ref_audio[:min_len], fmin=50, fmax=500, sr=ref_sr)
-            out_f0, _, _ = librosa.pyin(out_audio[:min_len], fmin=50, fmax=500, sr=out_sr)
-            ref_f0_clean = ref_f0[~np.isnan(ref_f0)] if ref_f0 is not None else np.array([130])
-            out_f0_clean = out_f0[~np.isnan(out_f0)] if out_f0 is not None else np.array([130])
-            ref_median = float(np.median(ref_f0_clean)) if len(ref_f0_clean) > 0 else 130
-            out_median = float(np.median(out_f0_clean)) if len(out_f0_clean) > 0 else 130
-            pitch_diff = abs(ref_median - out_median)
-            pitch_pct = max(0, 1.0 - pitch_diff / 100)
-            pitch_label = f"{pitch_diff:.0f} Hz off"
-            pitch_color = "#2ecc71" if pitch_diff < 20 else "#f39c12" if pitch_diff < 50 else "#e74c3c"
+            semitones_off = metrics["pitch_semitones"]
+            pitch_pct = max(0.0, 1.0 - semitones_off / 6.0)
+            pitch_label = f"{semitones_off:.1f} st off"
+            pitch_color = (
+                "#2ecc71" if semitones_off < 1.0
+                else "#f39c12" if semitones_off < 3.0
+                else "#e74c3c"
+            )
 
             # --- Quality Gauges (4 columns) ---
             gauges = ctk.CTkFrame(self.results_frame)
@@ -500,7 +621,7 @@ class VoicePanel(ctk.CTkFrame):
     # ── Audio Selector ──
 
     def _show_selector(self):
-        """Build a simple audio position selector with preview."""
+        """Drag-to-select waveform with edge handles, playhead, and shortcuts."""
         if self.selector_visible:
             self.selector_frame.destroy()
 
@@ -511,124 +632,236 @@ class VoicePanel(ctk.CTkFrame):
 
         ctk.CTkLabel(
             self.selector_frame,
-            text="Select a speech region to clone",
-            font=("Arial", 13, "bold")
+            text="Drag a region on the waveform · 6-12 s recommended",
+            font=("Arial", 13, "bold"),
         ).pack(pady=(8, 3))
 
-        # Waveform canvas
         self.waveform_canvas = Canvas(
-            self.selector_frame, height=100, bg="#1a1a1a",
-            highlightthickness=0, cursor="hand2"
+            self.selector_frame, height=140, bg="#1a1a1a",
+            highlightthickness=0, cursor="ibeam",
         )
         self.waveform_canvas.pack(padx=10, pady=5, fill="x")
         self.waveform_canvas.bind("<Configure>", lambda e: self._draw_waveform())
-        self.waveform_canvas.bind("<ButtonPress-1>", self._on_canvas_click)
+        self.waveform_canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.waveform_canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.waveform_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.waveform_canvas.bind("<Motion>", self._on_canvas_hover)
+        self.waveform_canvas.bind("<Enter>", lambda e: self.waveform_canvas.focus_set())
+        self.waveform_canvas.bind("<space>", self._on_keypress_space)
+        self.waveform_canvas.bind("<Left>", lambda e: self._nudge(-0.1))
+        self.waveform_canvas.bind("<Right>", lambda e: self._nudge(+0.1))
 
-        # Duration slider
-        dur_row = ctk.CTkFrame(self.selector_frame, fg_color="transparent")
-        dur_row.pack(padx=10, pady=(5, 2), fill="x")
+        # Default selection: 8 s starting at 0 (or full clip if shorter).
+        default_dur = min(8.0, self.raw_duration)
+        self.sel_start = 0.0
+        self.sel_end = default_dur
+        self.sel_duration = default_dur
 
-        ctk.CTkLabel(dur_row, text="Length:", width=60).pack(side="left")
-        self.sel_duration = 5.0
-        self.dur_slider = ctk.CTkSlider(
-            dur_row, from_=1, to=min(self.raw_duration, 30),
-            command=self._on_dur_change
+        # Drag/playhead state.
+        self._drag_mode = None
+        self._drag_anchor_t = None
+        self._playhead_t = None
+        self._playhead_start_time = None
+        self._playhead_after_id = None
+
+        info_row = ctk.CTkFrame(self.selector_frame, fg_color="transparent")
+        info_row.pack(padx=10, pady=(2, 2), fill="x")
+        self.sel_info_label = ctk.CTkLabel(
+            info_row, text=self._sel_info_text(),
+            font=("Arial", 11), text_color="cyan",
         )
-        self.dur_slider.pack(side="left", expand=True, fill="x", padx=5)
-        self.dur_slider.set(5.0)
-        self.dur_label = ctk.CTkLabel(dur_row, text="5.0s", width=45, text_color="cyan")
-        self.dur_label.pack(side="left")
+        self.sel_info_label.pack(side="left")
+        ctk.CTkLabel(
+            info_row,
+            text="Space: play/stop  ·  ←/→: nudge  ·  drag handles to resize",
+            font=("Arial", 10), text_color="gray",
+        ).pack(side="right")
 
-        # Position slider
-        pos_row = ctk.CTkFrame(self.selector_frame, fg_color="transparent")
-        pos_row.pack(padx=10, pady=2, fill="x")
-
-        ctk.CTkLabel(pos_row, text="Position:", width=60).pack(side="left")
-        self.pos_slider = ctk.CTkSlider(
-            pos_row, from_=0, to=max(self.raw_duration - self.sel_duration, 0.1),
-            command=self._on_pos_change
-        )
-        self.pos_slider.pack(side="left", expand=True, fill="x", padx=5)
-        self.pos_slider.set(self.sel_start)
-        self.pos_label = ctk.CTkLabel(
-            pos_row,
-            text=f"{self.sel_start:.1f}s — {self.sel_end:.1f}s",
-            width=120, text_color="cyan"
-        )
-        self.pos_label.pack(side="left")
-
-        # Buttons
         btn_row = ctk.CTkFrame(self.selector_frame, fg_color="transparent")
         btn_row.pack(padx=10, pady=(3, 8), fill="x")
-
         ctk.CTkButton(
             btn_row, text="Preview", width=100,
-            command=self._on_preview, fg_color="#3498db", hover_color="#2980b9"
+            command=self._on_preview, fg_color="#3498db", hover_color="#2980b9",
         ).pack(side="left", padx=(0, 5))
-
         ctk.CTkButton(
             btn_row, text="Stop", width=70,
-            command=lambda: sd.stop(), fg_color="#e74c3c", hover_color="#c0392b"
+            command=self._on_stop_preview, fg_color="#e74c3c", hover_color="#c0392b",
         ).pack(side="left", padx=(0, 5))
-
         self.use_btn = ctk.CTkButton(
             btn_row, text="Use This Region", width=140,
-            command=self._on_use_selection, fg_color="#2ecc71", hover_color="#27ae60"
+            command=self._on_use_selection,
+            fg_color="#2ecc71", hover_color="#27ae60",
         )
         self.use_btn.pack(side="left", padx=(0, 5))
-
         self.sel_status = ctk.CTkLabel(
-            btn_row, text="", text_color="gray", font=("Arial", 11)
+            btn_row, text="", text_color="gray", font=("Arial", 11),
         )
         self.sel_status.pack(side="left", padx=10)
 
-    def _on_canvas_click(self, event):
-        """Click on waveform to set position and preview from there."""
+    # ── Coord helpers ──
+
+    def _xy_to_time(self, x):
         w = self.waveform_canvas.winfo_width()
         if w <= 0 or self.raw_duration <= 0:
-            return
-        click_time = max(0, min(self.raw_duration - self.sel_duration, (event.x / w) * self.raw_duration))
-        self.sel_start = click_time
-        self.sel_end = min(click_time + self.sel_duration, self.raw_duration)
-        self.pos_slider.set(self.sel_start)
-        self._update_pos_label()
-        self._draw_waveform()
-        self._on_preview()
+            return 0.0
+        return max(0.0, min(self.raw_duration, (x / w) * self.raw_duration))
 
-    def _on_dur_change(self, value):
-        self.sel_duration = float(value)
-        self.dur_label.configure(text=f"{self.sel_duration:.1f}s")
-        # Update position slider max
-        self.pos_slider.configure(to=max(self.raw_duration - self.sel_duration, 0.1))
-        # Recalculate end
-        self.sel_end = min(self.sel_start + self.sel_duration, self.raw_duration)
-        self._update_pos_label()
-        self._draw_waveform()
+    def _time_to_x(self, t):
+        w = self.waveform_canvas.winfo_width()
+        if self.raw_duration <= 0:
+            return 0.0
+        return (t / self.raw_duration) * w
 
-    def _on_pos_change(self, value):
-        self.sel_start = float(value)
-        self.sel_end = min(self.sel_start + self.sel_duration, self.raw_duration)
-        self._update_pos_label()
-        self._draw_waveform()
+    # ── Mouse / keyboard events ──
 
-    def _update_pos_label(self):
-        self.pos_label.configure(text=f"{self.sel_start:.1f}s — {self.sel_end:.1f}s")
+    EDGE_HIT_PX = 8
+    MIN_SEL_S = 1.0
 
-    def _on_preview(self):
-        """Play the current 5-second selection."""
+    def _on_canvas_press(self, event):
         if self.raw_audio is None:
             return
-        sd.stop()
+        self.waveform_canvas.focus_set()
+        self._on_stop_preview()
+
+        sx1 = self._time_to_x(self.sel_start)
+        sx2 = self._time_to_x(self.sel_end)
+        if abs(event.x - sx1) <= self.EDGE_HIT_PX:
+            self._drag_mode = "left"
+        elif abs(event.x - sx2) <= self.EDGE_HIT_PX:
+            self._drag_mode = "right"
+        else:
+            self._drag_mode = "new"
+            self._drag_anchor_t = self._xy_to_time(event.x)
+            self.sel_start = self._drag_anchor_t
+            self.sel_end = self._drag_anchor_t
+        self._update_sel_state()
+
+    def _on_canvas_drag(self, event):
+        if self._drag_mode is None or self.raw_audio is None:
+            return
+        t = self._xy_to_time(event.x)
+        if self._drag_mode == "left":
+            self.sel_start = max(0.0, min(t, self.sel_end - self.MIN_SEL_S))
+        elif self._drag_mode == "right":
+            self.sel_end = min(self.raw_duration,
+                               max(t, self.sel_start + self.MIN_SEL_S))
+        else:  # new
+            if t >= self._drag_anchor_t:
+                self.sel_start = self._drag_anchor_t
+                self.sel_end = t
+            else:
+                self.sel_start = t
+                self.sel_end = self._drag_anchor_t
+        self._update_sel_state()
+
+    def _on_canvas_release(self, event):
+        if self._drag_mode is None:
+            return
+        was_new = self._drag_mode == "new"
+        self._drag_mode = None
+        # Single click without a drag: snap to a default 8 s window centered
+        # on the click instead of leaving a zero-width selection.
+        if was_new and self.sel_end - self.sel_start < self.MIN_SEL_S:
+            center = (self.sel_start + self.sel_end) / 2
+            half = min(4.0, self.raw_duration / 2)
+            self.sel_start = max(0.0, center - half)
+            self.sel_end = min(self.raw_duration, center + half)
+        self._update_sel_state()
+
+    def _on_canvas_hover(self, event):
+        if self._drag_mode is not None:
+            return
+        sx1 = self._time_to_x(self.sel_start)
+        sx2 = self._time_to_x(self.sel_end)
+        near_edge = (
+            abs(event.x - sx1) <= self.EDGE_HIT_PX
+            or abs(event.x - sx2) <= self.EDGE_HIT_PX
+        )
+        self.waveform_canvas.configure(
+            cursor="sb_h_double_arrow" if near_edge else "ibeam"
+        )
+
+    def _on_keypress_space(self, event):
+        if self._playhead_t is not None:
+            self._on_stop_preview()
+        else:
+            self._on_preview()
+        return "break"
+
+    def _nudge(self, delta_s):
+        new_start = max(
+            0.0,
+            min(self.raw_duration - self.MIN_SEL_S,
+                self.sel_start + delta_s),
+        )
+        new_end = min(self.raw_duration,
+                      max(new_start + self.MIN_SEL_S,
+                          self.sel_end + delta_s))
+        self.sel_start = new_start
+        self.sel_end = new_end
+        self._update_sel_state()
+
+    def _update_sel_state(self):
+        self.sel_duration = self.sel_end - self.sel_start
+        if hasattr(self, "sel_info_label"):
+            self.sel_info_label.configure(text=self._sel_info_text())
+        self._draw_waveform()
+
+    def _sel_info_text(self):
+        dur = max(0.0, self.sel_end - self.sel_start)
+        if 6.0 <= dur <= 12.0:
+            quality = "✓ optimal"
+        elif dur < 4.0:
+            quality = "⚠ too short"
+        elif dur > 18.0:
+            quality = "⚠ too long"
+        else:
+            quality = "ok"
+        return f"{self.sel_start:.2f} → {self.sel_end:.2f} s   ({dur:.2f} s, {quality})"
+
+    # ── Preview ──
+
+    def _on_preview(self):
+        if self.raw_audio is None:
+            return
+        self._on_stop_preview()
         start = int(self.sel_start * self.raw_sr)
         end = int(self.sel_end * self.raw_sr)
         region = self.raw_audio[start:end]
-        if len(region) > 0:
-            self.sel_status.configure(text="Playing...", text_color="cyan")
-            def play():
-                sd.play(region, self.raw_sr)
-                sd.wait()
-                self.after(0, lambda: self.sel_status.configure(text=""))
-            threading.Thread(target=play, daemon=True).start()
+        if len(region) == 0:
+            return
+        self.sel_status.configure(text="Playing…", text_color="cyan")
+        sd.play(region, self.raw_sr)
+        self._playhead_start_time = time.time()
+        self._playhead_t = self.sel_start
+        self._update_playhead()
+
+    def _on_stop_preview(self):
+        sd.stop()
+        if self._playhead_after_id is not None:
+            try:
+                self.after_cancel(self._playhead_after_id)
+            except Exception:
+                pass
+            self._playhead_after_id = None
+        self._playhead_t = None
+        if hasattr(self, "sel_status"):
+            self.sel_status.configure(text="")
+        self._draw_waveform()
+
+    def _update_playhead(self):
+        if self._playhead_t is None or self._playhead_start_time is None:
+            return
+        elapsed = time.time() - self._playhead_start_time
+        sel_len = self.sel_end - self.sel_start
+        if elapsed >= sel_len:
+            self._on_stop_preview()
+            return
+        self._playhead_t = self.sel_start + elapsed
+        self._draw_waveform()
+        self._playhead_after_id = self.after(33, self._update_playhead)
+
+    # ── Render ──
 
     def _draw_waveform(self):
         canvas = self.waveform_canvas
@@ -640,15 +873,15 @@ class VoicePanel(ctk.CTkFrame):
 
         audio = self.raw_audio
         duration = self.raw_duration
-        num_bars = min(w, 500)
+        num_bars = min(w, 600)
         samples_per_bar = max(1, len(audio) // num_bars)
         bar_width = w / num_bars
         mid_y = h // 2
 
-        # Selection background
-        sx1 = (self.sel_start / duration) * w
-        sx2 = (self.sel_end / duration) * w
-        canvas.create_rectangle(sx1, 0, sx2, h, fill="#1a3a1a", outline="")
+        sx1 = self._time_to_x(self.sel_start)
+        sx2 = self._time_to_x(self.sel_end)
+
+        canvas.create_rectangle(sx1, 0, sx2, h, fill="#1e3a26", outline="")
 
         for i in range(num_bars):
             idx = i * samples_per_bar
@@ -660,18 +893,39 @@ class VoicePanel(ctk.CTkFrame):
             t = (i / num_bars) * duration
             x = i * bar_width
             color = "#2ecc71" if self.sel_start <= t <= self.sel_end else "#444444"
-            canvas.create_line(x, mid_y - bar_h, x, mid_y + bar_h,
-                             fill=color, width=max(1, bar_width * 0.8))
+            canvas.create_line(
+                x, mid_y - bar_h, x, mid_y + bar_h,
+                fill=color, width=max(1, bar_width * 0.8),
+            )
 
-        # Boundary lines
-        canvas.create_line(sx1, 0, sx1, h, fill="#e74c3c", width=2)
-        canvas.create_line(sx2, 0, sx2, h, fill="#e74c3c", width=2)
+        # Edge handles: thicker rectangles + small grip marks so they read
+        # as draggable rather than as static guide lines.
+        for sx in (sx1, sx2):
+            canvas.create_rectangle(
+                sx - 2, 0, sx + 2, h, fill="#e74c3c", outline="",
+            )
+            for dy in (-12, 0, 12):
+                canvas.create_line(
+                    sx - 4, mid_y + dy, sx + 4, mid_y + dy,
+                    fill="white", width=1,
+                )
 
-        # Time labels on boundaries
-        canvas.create_text(sx1 + 3, 10, text=f"{self.sel_start:.1f}s",
-                          fill="#e74c3c", anchor="w", font=("Arial", 8))
-        canvas.create_text(sx2 - 3, 10, text=f"{self.sel_end:.1f}s",
-                          fill="#e74c3c", anchor="e", font=("Arial", 8))
+        canvas.create_text(
+            sx1 + 6, 11, text=f"{self.sel_start:.2f}s",
+            fill="#e74c3c", anchor="w", font=("Arial", 9, "bold"),
+        )
+        canvas.create_text(
+            sx2 - 6, 11, text=f"{self.sel_end:.2f}s",
+            fill="#e74c3c", anchor="e", font=("Arial", 9, "bold"),
+        )
+
+        if self._playhead_t is not None:
+            px = self._time_to_x(self._playhead_t)
+            canvas.create_line(px, 0, px, h, fill="#f39c12", width=2)
+            canvas.create_polygon(
+                px - 5, 0, px + 5, 0, px, 9,
+                fill="#f39c12", outline="",
+            )
 
     def _on_use_selection(self):
         """Clean the selected region and set it as reference."""
@@ -712,19 +966,35 @@ class VoicePanel(ctk.CTkFrame):
                 sf.write(full_path, cleaned, self.raw_sr)
 
                 import mlx_whisper
-                result = mlx_whisper.transcribe(full_path)
+                # whisper-large-v3-turbo: distilled large-v3, ~800 MB, faster
+                # than medium with near-large quality. Multilingual including
+                # Turkish with proper diacritics. language=None lets the
+                # detector pick on its own — turbo handles auto-detect well
+                # on clips longer than a few seconds.
+                result = mlx_whisper.transcribe(
+                    full_path,
+                    path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+                )
                 ref_text = result.get("text", "").strip()
-                self.log.success(f"Full transcription: \"{ref_text}\"")
+                detected_lang = result.get("language", "?")
+                self.log.success(
+                    f"Transcription [{detected_lang}]: \"{ref_text}\""
+                )
+                self._ref_lang = detected_lang
 
-                # f5-tts works best with 6-8s reference
-                max_ref_samples = int(8.0 * self.raw_sr)
+                # XTTS-v2 sweet spot is 6-12 s; if the cleaned region is
+                # longer, pick the loudest 12 s window (most likely speech).
+                max_ref_samples = int(12.0 * self.raw_sr)
                 if len(cleaned) > max_ref_samples:
-                    self.log.info(f"Trimming audio to 8s for cloning model. Full: {len(cleaned)/self.raw_sr:.1f}s")
+                    self.log.info(
+                        f"Trimming audio to 12s for cloning model. "
+                        f"Full: {len(cleaned)/self.raw_sr:.1f}s"
+                    )
                     best_start = 0
-                    best_rms = 0
+                    best_rms = 0.0
                     hop = self.raw_sr
                     for s in range(0, len(cleaned) - max_ref_samples, hop):
-                        rms = float(np.sqrt(np.mean(cleaned[s:s+max_ref_samples]**2)))
+                        rms = float(np.sqrt(np.mean(cleaned[s:s + max_ref_samples] ** 2)))
                         if rms > best_rms:
                             best_rms = rms
                             best_start = s
@@ -805,6 +1075,24 @@ class VoicePanel(ctk.CTkFrame):
 
     # ── Generate ──
 
+    _TURKISH_CHARS = set("şŞğĞıİçÇöÖüÜâÂîÎûÛ")
+
+    def _detect_text_language(self, text):
+        """Pick an XTTS language code for the typed text.
+
+        Heuristic: any Turkish-specific character → Turkish. Otherwise fall
+        back to whatever language Whisper detected for the reference audio
+        (so an English speaker reading English text gets language=en), and
+        finally default to Turkish since that's the primary use case.
+        """
+        if any(c in self._TURKISH_CHARS for c in text):
+            return "tr"
+        ref_lang = getattr(self, "_ref_lang", None)
+        if ref_lang in {"en", "es", "fr", "de", "it", "pt", "pl", "tr",
+                        "ru", "nl", "cs", "ar", "hu", "ko", "ja", "hi"}:
+            return ref_lang
+        return "tr"
+
     def _on_generate(self):
         text = self.text_input.get("1.0", "end").strip()
         if not text:
@@ -818,12 +1106,27 @@ class VoicePanel(ctk.CTkFrame):
             self.status.configure(text="Upload audio and click 'Use Selection' first.", text_color="red")
             return
 
-        msg = "Cloning voice (~15s)..." if is_upload else "Generating..."
+        if is_upload and not self.consent_var.get():
+            self.status.configure(
+                text="Please confirm consent before cloning a voice.",
+                text_color="red",
+            )
+            return
+
+        if is_upload and not self.voice_module.is_ready():
+            self.status.configure(
+                text="XTTS model is still loading. Please wait a moment…",
+                text_color="orange",
+            )
+            return
+
+        msg = "Cloning voice (~5s)…" if is_upload else "Generating…"
         self._start_loading(msg)
 
         pitch = int(self.pitch_slider.get())
         speed = round(self.speed_slider.get(), 2)
         preset = self.preset_selector.get()
+        chosen_lang = self._resolve_language(text) if is_upload else None
 
         ref_path = None
         if is_upload and self.voice_module.reference_path:
@@ -832,13 +1135,17 @@ class VoicePanel(ctk.CTkFrame):
         def run():
             try:
                 if is_upload:
-                    self.log.info(f"Cloning voice: \"{text[:50]}...\"")
-                    output_path = self.voice_module.synthesize_from_reference(text)
+                    self.log.info(f"Cloning voice [{chosen_lang}]: \"{text[:50]}...\"")
+                    output_path = self.voice_module.synthesize_from_reference(
+                        text, language=chosen_lang,
+                    )
                     self.log.success(f"Voice cloned: {os.path.basename(output_path)}")
+                    history_lang = chosen_lang
                 else:
                     self.log.info(f"Generating preset '{preset}': \"{text[:50]}...\"")
                     output_path = self.voice_module.synthesize_from_preset(text, preset)
                     self.log.success(f"Preset generated: {os.path.basename(output_path)}")
+                    history_lang = "preset"
 
                 if pitch != 0 or speed != 1.0:
                     self.log.info(f"Applying adjustments: pitch={pitch}, speed={speed}x")
@@ -851,6 +1158,7 @@ class VoicePanel(ctk.CTkFrame):
                 self._play_audio(output_path)
 
                 self.after(0, lambda: self._show_replay(output_path))
+                self.after(0, lambda: self._add_to_history(output_path, text, history_lang))
                 self.after(0, lambda: self.status.configure(
                     text=f"Done! Saved: {os.path.basename(output_path)}",
                     text_color="green"

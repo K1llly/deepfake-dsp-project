@@ -6,9 +6,11 @@ soundfile>=0.12.0
 sounddevice>=0.4.6
 noisereduce>=3.0.0
 
-# Voice synthesis (Apple Silicon required for f5-tts-mlx and mlx-whisper)
+# Voice synthesis
+# coqui-tts hosts XTTS-v2: multilingual cloning incl. Turkish/Arabic/etc.
+# mlx-whisper is Apple Silicon only (CoreML/MLX) and powers transcription.
 edge-tts>=7.0.0
-f5-tts-mlx>=0.2.0
+coqui-tts>=0.24.0
 mlx-whisper>=0.4.0
 
 # Computer vision & face processing

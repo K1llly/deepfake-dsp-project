@@ -117,6 +117,76 @@ class EvaluationModule:
         ssim = numerator / denominator
         return round(ssim, 4)
 
+    def calculate_audio_clarity(self, audio):
+        """RMS-based loudness/clarity score in [0, 1]. 0.15 RMS ≈ full."""
+        if len(audio) == 0:
+            return 0.0
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        return float(min(1.0, rms / 0.15))
+
+    def calculate_voice_similarity(self, ref_audio, ref_sr, out_audio, out_sr):
+        """Cosine similarity over an MFCC-based voice embedding.
+
+        Skips MFCC[0] (log-energy), augments with delta and delta-delta
+        means, L2-normalizes, then takes cosine. Trims silence on both
+        clips so the embedding reflects voiced speech only. Returns a
+        value in [0, 1] — same speaker should land 0.80-0.95.
+        """
+        min_len = min(len(ref_audio), len(out_audio))
+        if min_len < 1000:
+            return 0.5
+        ref_voiced, _ = librosa.effects.trim(ref_audio, top_db=25)
+        out_voiced, _ = librosa.effects.trim(out_audio, top_db=25)
+        ref_feat = self._voice_embed(ref_voiced, ref_sr)
+        out_feat = self._voice_embed(out_voiced, out_sr)
+        cosine_sim = float(np.dot(ref_feat, out_feat))
+        return float(max(0.0, min(1.0, cosine_sim)))
+
+    def _voice_embed(self, y, sr):
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)[1:]
+        d1 = librosa.feature.delta(mfcc)
+        d2 = librosa.feature.delta(mfcc, order=2)
+        feat = np.concatenate([
+            np.mean(mfcc, axis=1),
+            np.mean(d1, axis=1),
+            np.mean(d2, axis=1),
+        ])
+        return feat / (np.linalg.norm(feat) + 1e-8)
+
+    def calculate_pitch_difference_semitones(
+        self, ref_audio, ref_sr, out_audio, out_sr
+    ):
+        """Median-pitch difference in semitones (musical interval).
+
+        Robust to register: a 50 Hz raw difference at 100 Hz vs 300 Hz
+        means very different perceptual changes, but one semitone is one
+        semitone everywhere. Returns absolute interval in semitones.
+        """
+        ref_f0, _, _ = librosa.pyin(ref_audio, fmin=50, fmax=500, sr=ref_sr)
+        out_f0, _, _ = librosa.pyin(out_audio, fmin=50, fmax=500, sr=out_sr)
+        ref_clean = ref_f0[~np.isnan(ref_f0)] if ref_f0 is not None else np.array([])
+        out_clean = out_f0[~np.isnan(out_f0)] if out_f0 is not None else np.array([])
+        ref_median = float(np.median(ref_clean)) if len(ref_clean) > 0 else 130.0
+        out_median = float(np.median(out_clean)) if len(out_clean) > 0 else 130.0
+        return float(abs(12.0 * np.log2(out_median / max(ref_median, 1e-3))))
+
+    def evaluate_clone(self, ref_audio, ref_sr, out_audio, out_sr):
+        """Aggregate metrics for a voice clone vs its reference.
+
+        Returns a dict the UI can render directly. Each metric is also
+        callable individually for testing.
+        """
+        return {
+            "hnr_db": self.calculate_hnr(out_audio, out_sr),
+            "clarity": self.calculate_audio_clarity(out_audio),
+            "voice_similarity": self.calculate_voice_similarity(
+                ref_audio, ref_sr, out_audio, out_sr
+            ),
+            "pitch_semitones": self.calculate_pitch_difference_semitones(
+                ref_audio, ref_sr, out_audio, out_sr
+            ),
+        }
+
     def evaluate_audio(self, original_audio, processed_audio):
         """Run full audio evaluation."""
         return {
