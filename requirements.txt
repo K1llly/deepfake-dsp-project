@@ -1,9 +1,23 @@
-opencv-python>=4.8.0
-mediapipe>=0.10.0
+# Core DSP & audio processing
 numpy>=1.24.0
+scipy>=1.11.0
 librosa>=0.10.0
 soundfile>=0.12.0
-pyttsx3>=2.90
-customtkinter>=5.2.0
+sounddevice>=0.4.6
+noisereduce>=3.0.0
+
+# Voice synthesis (Apple Silicon required for f5-tts-mlx and mlx-whisper)
+edge-tts>=7.0.0
+f5-tts-mlx>=0.2.0
+mlx-whisper>=0.4.0
+
+# Computer vision & face processing
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+insightface>=0.7.0
+onnxruntime>=1.16.0
 Pillow>=10.0.0
-scipy>=1.11.0
+
+# UI & visualization
+customtkinter>=5.2.0
+matplotlib>=3.8.0
