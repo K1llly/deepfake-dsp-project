@@ -123,7 +123,7 @@ class VoiceCloningModule:
             f"        ref_audio_path={json.dumps(self.reference_path)},",
             f"        ref_audio_text={json.dumps(self.reference_text or '')},",
             f"        output_path={json.dumps(final_path)},",
-            f"        steps=8, speed=1.0,",
+            f"        steps=32, speed=1.0,",
             f"    )",
             f"    if os.path.getsize({json.dumps(final_path)}) < 10000:",
             f"        print('Retrying with forced duration')",
@@ -133,7 +133,7 @@ class VoiceCloningModule:
             f"            ref_audio_text={json.dumps(self.reference_text or '')},",
             f"            output_path={json.dumps(final_path)},",
             f"            duration={duration_sec},",
-            f"            steps=8, speed=1.0,",
+            f"            steps=32, speed=1.0,",
             f"        )",
             f"    print('SUCCESS')",
             "except Exception as e:",
@@ -146,7 +146,7 @@ class VoiceCloningModule:
 
         result = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=120, env=env,
+            capture_output=True, text=True, timeout=240, env=env,
         )
 
         if result.returncode != 0:

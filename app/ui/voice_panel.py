@@ -232,12 +232,28 @@ class VoicePanel(ctk.CTkFrame):
             clarity_label = "Excellent" if clarity_pct > 0.7 else "Good" if clarity_pct > 0.4 else "Weak"
             clarity_color = "#2ecc71" if clarity_pct > 0.7 else "#f39c12" if clarity_pct > 0.4 else "#e74c3c"
 
-            # Voice Match (MFCC cosine similarity)
+            # Voice Match (timbre + dynamics, content-independent)
+            # Uses MFCC[1:] (skip log-energy), delta, and delta-delta means.
+            # Trim silence on both clips so the comparison reflects voiced speech only.
             if min_len > 1000:
-                ref_mfcc = np.mean(librosa.feature.mfcc(y=ref_audio[:min_len], sr=ref_sr, n_mfcc=13), axis=1)
-                out_mfcc = np.mean(librosa.feature.mfcc(y=out_audio[:min_len], sr=out_sr, n_mfcc=13), axis=1)
-                cosine_sim = float(np.dot(ref_mfcc, out_mfcc) / (np.linalg.norm(ref_mfcc) * np.linalg.norm(out_mfcc) + 1e-8))
-                match_pct = max(0, cosine_sim)
+                ref_voiced, _ = librosa.effects.trim(ref_audio, top_db=25)
+                out_voiced, _ = librosa.effects.trim(out_audio, top_db=25)
+
+                def _voice_embed(y, sr):
+                    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)[1:]
+                    d1 = librosa.feature.delta(mfcc)
+                    d2 = librosa.feature.delta(mfcc, order=2)
+                    feat = np.concatenate([
+                        np.mean(mfcc, axis=1),
+                        np.mean(d1, axis=1),
+                        np.mean(d2, axis=1),
+                    ])
+                    return feat / (np.linalg.norm(feat) + 1e-8)
+
+                ref_feat = _voice_embed(ref_voiced, ref_sr)
+                out_feat = _voice_embed(out_voiced, out_sr)
+                cosine_sim = float(np.dot(ref_feat, out_feat))
+                match_pct = max(0.0, min(1.0, cosine_sim))
             else:
                 match_pct = 0.5
             match_label = "High" if match_pct > 0.85 else "Medium" if match_pct > 0.6 else "Low"
