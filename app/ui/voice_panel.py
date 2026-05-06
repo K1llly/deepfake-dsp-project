@@ -55,6 +55,11 @@ class VoicePanel(ctk.CTkFrame):
         self.evaluation = EvaluationModule()
         self.log = get_logger()
         self.use_reference = False
+        # True while the reference-processing thread (noise reduction +
+        # whisper transcription) is still running. The Whisper model is
+        # ~1.5 GB and downloads on first run, so this can take a few
+        # minutes. Used to give the user a clearer Generate-button error.
+        self._reference_processing = False
 
         # Raw audio data for timeline
         self.raw_audio = None
@@ -932,12 +937,21 @@ class VoicePanel(ctk.CTkFrame):
         if self.raw_audio is None:
             return
 
+        # Stop any running preview so the user doesn't hear the sample
+        # over the next minute of processing.
+        self._on_stop_preview()
+
         start = int(self.sel_start * self.raw_sr)
         end = int(self.sel_end * self.raw_sr)
         selection = self.raw_audio[start:end]
 
         self.sel_status.configure(text="Processing...", text_color="yellow")
         self.use_btn.configure(state="disabled")
+        # Disable Generate while we prepare the reference so the user
+        # cannot click it during the (potentially multi-minute) Whisper
+        # download / transcription and get a confusing "no reference" error.
+        self.generate_button.configure(state="disabled")
+        self._reference_processing = True
 
         def process():
             try:
@@ -958,7 +972,8 @@ class VoicePanel(ctk.CTkFrame):
 
                 # Transcribe the FULL cleaned audio first (more context = better accuracy)
                 self.after(0, lambda: self.sel_status.configure(
-                    text="Transcribing full clip...", text_color="yellow"
+                    text="Transcribing… (first run downloads ~1.5 GB Whisper model)",
+                    text_color="yellow",
                 ))
                 self.log.info(f"Transcribing full clip ({len(cleaned)/self.raw_sr:.1f}s) for better accuracy...")
 
@@ -1022,7 +1037,9 @@ class VoicePanel(ctk.CTkFrame):
                     text=f"Error: {e}", text_color="red"
                 ))
             finally:
+                self._reference_processing = False
                 self.after(0, lambda: self.use_btn.configure(state="normal"))
+                self.after(0, lambda: self.generate_button.configure(state="normal"))
 
         threading.Thread(target=process, daemon=True).start()
 
@@ -1102,8 +1119,18 @@ class VoicePanel(ctk.CTkFrame):
         current_tab = self.source_tabs.get()
         is_upload = current_tab == "Upload Sample"
 
+        if is_upload and self._reference_processing:
+            self.status.configure(
+                text="Reference still being prepared (transcribing). Hang on a moment…",
+                text_color="orange",
+            )
+            return
+
         if is_upload and not self.use_reference:
-            self.status.configure(text="Upload audio and click 'Use Selection' first.", text_color="red")
+            self.status.configure(
+                text="Upload audio and click 'Use This Region' first.",
+                text_color="red",
+            )
             return
 
         if is_upload and not self.consent_var.get():

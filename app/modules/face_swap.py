@@ -23,7 +23,7 @@ class FaceSwapModule:
         # shape and crashes at inference time on our ORT version.
         self.app = FaceAnalysis(
             name="buffalo_s",
-            allowed_modules=["detection", "recognition"],
+            allowed_modules=["detection", "landmark_2d_106", "recognition"],
             providers=["CPUExecutionProvider"],
         )
         self.app.prepare(ctx_id=0, det_size=(160, 160))
@@ -149,6 +149,19 @@ class FaceSwapModule:
             kps=self._kps_smoothed.copy() if self._kps_smoothed is not None else None,
             det_score=score,
         )
+
+        # Run the 106-point landmark model on the detected face. The mesh
+        # is what lets us build a face-shaped blend mask (convex hull of
+        # the jawline points) instead of a crude ellipse — the integration
+        # boundary moves from "obvious oval over the face" to "follows the
+        # actual face shape." Same trick Deep-Live-Cam uses.
+        lm_model = self.app.models.get("landmark_2d_106")
+        if lm_model is not None:
+            try:
+                lm_model.get(frame, face)
+            except Exception:
+                pass
+
         self.last_target_face = face
         self._cached_blend_mask = self._build_blend_mask(frame.shape, face)
         return True
@@ -228,8 +241,41 @@ class FaceSwapModule:
         return blended.astype(np.uint8)
 
     def _build_blend_mask(self, frame_shape, face):
-        """Elliptical Gaussian-feathered blend mask, expanded around the face."""
+        """Face-shaped Gaussian-feathered blend mask.
+
+        Uses the 106-point landmark mesh: take the jawline + cheek points
+        (indices 0-32, the face outline), build a convex hull, pad it
+        outward 5%, fill, and feather. This hugs the actual face shape
+        instead of imposing an ellipse — the swap boundary becomes
+        invisible because there's no longer an oval edge cutting through
+        the cheeks/forehead. Falls back to an expanded ellipse when the
+        landmark model didn't run (e.g. mid-pipeline failure).
+        """
         h, w = frame_shape[:2]
+        landmarks = getattr(face, "landmark_2d_106", None)
+
+        if landmarks is not None and len(landmarks) >= 33:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            face_outline = landmarks[0:33].astype(np.float32)
+            face_w = float(np.linalg.norm(landmarks[0] - landmarks[16]))
+            padding = max(2.0, face_w * 0.05)
+
+            hull = cv2.convexHull(face_outline.astype(np.int32))
+            hull_pts = hull.reshape(-1, 2).astype(np.float32)
+            center = np.mean(face_outline, axis=0)
+            directions = hull_pts - center
+            norms = np.linalg.norm(directions, axis=1, keepdims=True)
+            directions /= np.maximum(norms, 1e-6)
+            hull_padded = (hull_pts + directions * padding).astype(np.int32)
+
+            cv2.fillConvexPoly(mask, hull_padded, 255)
+            blur_size = max(21, int(face_w / 8) | 1)
+            mask = cv2.GaussianBlur(mask, (blur_size, blur_size), blur_size // 3)
+
+            mask_float = mask.astype(np.float32) / 255.0
+            return np.stack([mask_float] * 3, axis=-1)
+
+        # Fallback: expanded ellipse around the bbox.
         bbox = face.bbox.astype(int)
         x1, y1, x2, y2 = bbox
         face_w = x2 - x1
