@@ -12,7 +12,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from app.modules.input_module import InputModule, InputValidationError
-from app.modules.face_swap import FaceSwapModule
+# FaceSwapModule pulls in insightface, which has no Windows wheel and needs a
+# C++ toolchain to build from source. Import it lazily so the rest of the app
+# (voice cloning) still runs on machines without it.
 from app.modules.output_module import OutputModule
 from app.modules.evaluation import EvaluationModule
 from app.utils.logger import get_logger
@@ -65,7 +67,15 @@ class FacePanel(ctk.CTkFrame):
         super().__init__(parent)
 
         self.input_module = InputModule()
-        self.face_swap_module = FaceSwapModule()
+        try:
+            from app.modules.face_swap import FaceSwapModule
+            self.face_swap_module = FaceSwapModule()
+            self.face_swap_error = None
+        except Exception as e:
+            # insightface missing or inswapper_128.onnx not provided — the
+            # Voice Cloning tab still works; Face Swap is disabled.
+            self.face_swap_module = None
+            self.face_swap_error = str(e)
         self.output_module = OutputModule()
         self.evaluation_module = EvaluationModule()
         self.log = get_logger()
@@ -193,8 +203,19 @@ class FacePanel(ctk.CTkFrame):
 
     # ── Controls ──
 
+    def _face_swap_unavailable(self):
+        """True if the face-swap backend failed to load; surfaces why."""
+        if self.face_swap_module is None:
+            msg = f"Face Swap unavailable: {self.face_swap_error}"
+            self.status_label.configure(text=msg, text_color="red")
+            self.log.error(msg)
+            return True
+        return False
+
     def _on_load_source(self):
         """Load the face image to overlay."""
+        if self._face_swap_unavailable():
+            return
         file_path = filedialog.askopenfilename(
             filetypes=[("Images", "*.jpg *.jpeg *.png")]
         )
@@ -244,6 +265,8 @@ class FacePanel(ctk.CTkFrame):
 
     def _on_start_webcam(self):
         """Start the webcam feed."""
+        if self._face_swap_unavailable():
+            return
         if self.source_image is None:
             self.status_label.configure(
                 text="Upload a face image first!", text_color="red"

@@ -11,12 +11,12 @@ noisereduce>=3.0.0
 # mlx-whisper is Apple Silicon only (CoreML/MLX) and powers transcription.
 edge-tts>=7.0.0
 coqui-tts>=0.24.0
-mlx-whisper>=0.4.0
+# mlx-whisper>=0.4.0  # Apple-Silicon only (MLX); disabled on Windows. Auto-transcription path unavailable.
 
 # Computer vision & face processing
 opencv-python>=4.8.0
 mediapipe>=0.10.0
-insightface>=0.7.0
+# insightface>=0.7.0  # No Windows wheel; needs MSVC C++ build tools. Face Swap tab disabled until installed.
 onnxruntime>=1.16.0
 Pillow>=10.0.0
 
